@@ -18,6 +18,8 @@ import {
     ContentRedactionOutput,
     LanguageCode,
     ContentRedactionType,
+    Item,
+    Result,
 } from '@aws-sdk/client-transcribe-streaming';
 
 import { 
@@ -31,13 +33,13 @@ import {
     CallRecordingEvent,
     AddTranscriptSegmentEvent,
     AddCallCategoryEvent,
-    Uuid,
-    SocketCallData
-} from './entities-lca';
+    SocketCallData,
+    CallMetaData,
+} from './types';
 
 import {
     normalizeErrorForLogging,
-} from './utils';
+} from '../common';
 
 import stream from 'stream';
 
@@ -57,6 +59,8 @@ const AWS_REGION = process.env['AWS_REGION'] || 'us-east-1';
 const TRANSCRIBE_API_MODE = process.env['TRANSCRIBE_API_MODE'] || 'standard';
 const isTCAEnabled = TRANSCRIBE_API_MODE === 'analytics';
 const TRANSCRIBE_LANGUAGE_CODE = process.env['TRANSCRIBE_LANGUAGE_CODE'] || 'en-US';
+const TRANSCRIBE_LANGUAGE_OPTIONS = process.env['TRANSCRIBE_LANGUAGE_OPTIONS'] || undefined;
+const TRANSCRIBE_PREFERRED_LANGUAGE = process.env['TRANSCRIBE_PREFERRED_LANGUAGE'] || 'None';
 const CUSTOM_VOCABULARY_NAME = process.env['CUSTOM_VOCABULARY_NAME'] || undefined;
 const CUSTOM_LANGUAGE_MODEL_NAME = process.env['CUSTOM_LANGUAGE_MODEL_NAME'] || undefined;
 const IS_CONTENT_REDACTION_ENABLED = (process.env['IS_CONTENT_REDACTION_ENABLED'] || '') === 'true';
@@ -72,22 +76,14 @@ const POST_CALL_CONTENT_REDACTION_OUTPUT = process.env['POST_CALL_CONTENT_REDACT
 
 const savePartial = (process.env['SAVE_PARTIAL_TRANSCRIPTS'] || 'true') === 'true';
 const kdsStreamName = process.env['KINESIS_STREAM_NAME'] || '';
+const showSpeakerLabel = (process.env['SHOW_SPEAKER_LABEL'] || 'true') === 'true';
 
 const tcaOutputLocation = `s3://${RECORDINGS_BUCKET_NAME}/${CALL_ANALYTICS_FILE_PREFIX}`;
 
 type transcriptionCommandInput<TCAEnabled> = TCAEnabled extends true 
     ? StartCallAnalyticsStreamTranscriptionCommandInput
     : StartStreamTranscriptionCommandInput;
-  
-export type CallMetaData = {
-    callId: Uuid,
-    fromNumber?: string,
-    toNumber?: string,
-    shouldRecordCall?: boolean,
-    agentId?: string,
-    samplingRate: number,
-    callEvent: string,
-};
+
 
 const kinesisClient = new KinesisClient({ region: AWS_REGION });
 const transcribeClient = new TranscribeStreamingClient({ region: AWS_REGION });
@@ -140,7 +136,8 @@ export const writeCallRecordingEvent = async (callMetaData: CallMetaData, record
     await writeCallEvent(callRecordingEvent, server);  
 };
 
-export const writeTranscriptionSegment = async function(transcribeMessageJson:TranscriptEvent, callId: Uuid, server: FastifyInstance) {
+export const writeTranscriptionSegment = async function (transcribeMessageJson: TranscriptEvent, callMetaData: CallMetaData, server: FastifyInstance) {
+    
     if (transcribeMessageJson.Transcript?.Results && transcribeMessageJson.Transcript?.Results.length > 0) {
         if (transcribeMessageJson.Transcript?.Results[0].Alternatives && transcribeMessageJson.Transcript?.Results[0].Alternatives?.length > 0) {
 
@@ -154,7 +151,7 @@ export const writeTranscriptionSegment = async function(transcribeMessageJson:Tr
 
             const kdsObject:AddTranscriptSegmentEvent = {
                 EventType: 'ADD_TRANSCRIPT_SEGMENT',
-                CallId: callId,
+                CallId: callMetaData.callId,
                 Channel: (result.ChannelId ==='ch_0' ? 'CALLER' : 'AGENT'),
                 SegmentId: result.ResultId || '',
                 StartTime: result.StartTime || 0,
@@ -166,41 +163,35 @@ export const writeTranscriptionSegment = async function(transcribeMessageJson:Tr
                 Sentiment: undefined,
                 TranscriptEvent: undefined,
                 UtteranceEvent: undefined,
+                Speaker: (result.ChannelId === 'ch_0' ? callMetaData.activeSpeaker : (callMetaData?.agentId ?? 'n/a'))
             };
 
             const putParams = {
                 StreamName: kdsStreamName,
-                PartitionKey: callId,
+                PartitionKey: callMetaData.callId,
                 Data: Buffer.from(JSON.stringify(kdsObject)),
             };
 
             const putCmd = new PutRecordCommand(putParams);
             try {
                 await kinesisClient.send(putCmd);
-                server.log.debug(`[${kdsObject.EventType}]: [${callId}] - Written ${kdsObject.EventType} event to KDS: ${JSON.stringify(kdsObject)}`);
+                server.log.debug(`[${kdsObject.EventType}]: [${callMetaData.callId}] - Written ${kdsObject.EventType} event to KDS: ${JSON.stringify(kdsObject)}`);
             } catch (error) {
-                server.log.error(`[${kdsObject.EventType}]: [${callId}] - Error writing ${kdsObject.EventType} to KDS : ${normalizeErrorForLogging(error)} KDS object: ${JSON.stringify(kdsObject)}`);
+                server.log.error(`[${kdsObject.EventType}]: [${callMetaData.callId}] - Error writing ${kdsObject.EventType} to KDS : ${normalizeErrorForLogging(error)} KDS object: ${JSON.stringify(kdsObject)}`);
             }
         } 
     } 
 };
 
-export const writeAddTranscriptSegmentEvent = async function(utteranceEvent:UtteranceEvent | undefined , 
-    transcriptEvent:TranscriptEvent | undefined,  callId: Uuid, server: FastifyInstance) {
-    
-    if (transcriptEvent) {
-        if (transcriptEvent.Transcript?.Results && transcriptEvent.Transcript?.Results.length > 0) {
-            if (transcriptEvent.Transcript?.Results[0].Alternatives && transcriptEvent.Transcript?.Results[0].Alternatives?.length > 0) {
-            
-                const result = transcriptEvent.Transcript?.Results[0];
-                if (result.IsPartial == undefined || (result.IsPartial == true && !savePartial)) {
-                    return;
-                }
-            }
-        }
-    }
-                
+export const writeUtteranceEvent = async function(utteranceEvent:UtteranceEvent, callMetaData: CallMetaData, server: FastifyInstance) {
+    let isCustomer = false;
+
     if (utteranceEvent) {
+        if (utteranceEvent.ParticipantRole === ParticipantRole.CUSTOMER) {
+            isCustomer = true;
+        } else {
+            isCustomer = false;
+        }
         if (utteranceEvent.IsPartial == undefined || (utteranceEvent.IsPartial == true && !savePartial)) {
             return;
         }
@@ -210,53 +201,54 @@ export const writeAddTranscriptSegmentEvent = async function(utteranceEvent:Utte
 
     const kdsObject:AddTranscriptSegmentEvent = {
         EventType: 'ADD_TRANSCRIPT_SEGMENT',
-        CallId: callId,
-        TranscriptEvent: transcriptEvent,
+        CallId: callMetaData.callId,
+        TranscriptEvent: undefined,
         UtteranceEvent: utteranceEvent,
         CreatedAt: now,
         UpdatedAt: now,
+        Speaker: (isCustomer ? callMetaData.activeSpeaker : (callMetaData?.agentId ?? 'n/a')),
     };
 
     const putParams = {
         StreamName: kdsStreamName,
-        PartitionKey: callId,
+        PartitionKey: callMetaData.callId,
         Data: Buffer.from(JSON.stringify(kdsObject)),
     };
 
     const putCmd = new PutRecordCommand(putParams);
     try {
         await kinesisClient.send(putCmd);
-        server.log.debug(`[${kdsObject.EventType}]: [${callId}] - Written ${kdsObject.EventType} event to KDS: ${JSON.stringify(kdsObject)}`);
+        server.log.debug(`[${kdsObject.EventType}]: [${callMetaData.callId}] - Written ${kdsObject.EventType} event to KDS: ${JSON.stringify(kdsObject)}`);
     } catch (error) {
-        server.log.error(`[${kdsObject.EventType}]: [${callId}] - Error writing ${kdsObject.EventType} to KDS : ${normalizeErrorForLogging(error)} KDS object: ${JSON.stringify(kdsObject)}`);
+        server.log.error(`[${kdsObject.EventType}]: [${callMetaData.callId}] - Error writing ${kdsObject.EventType} to KDS : ${normalizeErrorForLogging(error)} KDS object: ${JSON.stringify(kdsObject)}`);
     }
 };
 
-export const writeAddCallCategoryEvent = async function(categoryEvent:CategoryEvent, callId: Uuid, server: FastifyInstance) {
+export const writeAddCallCategoryEvent = async function(categoryEvent:CategoryEvent, callMetaData: CallMetaData, server: FastifyInstance) {
 
     if (categoryEvent) {
         const now = new Date().toISOString();
     
         const kdsObject:AddCallCategoryEvent = {
             EventType: 'ADD_CALL_CATEGORY',
-            CallId: callId,
+            CallId: callMetaData.callId,
             CategoryEvent: categoryEvent,
             CreatedAt: now,
         };
 
         const putParams = {
             StreamName: kdsStreamName,
-            PartitionKey: callId,
+            PartitionKey: callMetaData.callId,
             Data: Buffer.from(JSON.stringify(kdsObject)),
         };
 
         const putCmd = new PutRecordCommand(putParams);
         try {
             await kinesisClient.send(putCmd);
-            server.log.debug(`[${kdsObject.EventType}]: [${callId}] - Written ${kdsObject.EventType} event to KDS: ${JSON.stringify(kdsObject)}`);
+            server.log.debug(`[${kdsObject.EventType}]: [${callMetaData.callId}] - Written ${kdsObject.EventType} event to KDS: ${JSON.stringify(kdsObject)}`);
             
         } catch (error) {
-            server.log.error(`[${kdsObject.EventType}]: [${callId}] - Error writing ${kdsObject.EventType} to KDS : ${normalizeErrorForLogging(error)} KDS object: ${JSON.stringify(kdsObject)}`);
+            server.log.error(`[${kdsObject.EventType}]: [${callMetaData.callId}] - Error writing ${kdsObject.EventType} to KDS : ${normalizeErrorForLogging(error)} KDS object: ${JSON.stringify(kdsObject)}`);
         }
 
     }
@@ -294,22 +286,38 @@ export const startTranscribe = async (callMetaData: CallMetaData, audioInputStre
     let outputTranscriptStream: AsyncIterable<TranscriptResultStream> | undefined;
     
     const tsParams:transcriptionCommandInput<typeof isTCAEnabled> = {
-        LanguageCode: TRANSCRIBE_LANGUAGE_CODE as LanguageCode,
         MediaSampleRateHertz: callMetaData.samplingRate,
         MediaEncoding: 'pcm',
         AudioStream: transcribeInput()
     };
-    
-    if (IS_CONTENT_REDACTION_ENABLED && (
-        TRANSCRIBE_LANGUAGE_CODE === 'en-US' ||
-        TRANSCRIBE_LANGUAGE_CODE === 'en-AU' ||
-        TRANSCRIBE_LANGUAGE_CODE === 'en-GB' ||
-        TRANSCRIBE_LANGUAGE_CODE === 'es-US')) {
+
+    if (TRANSCRIBE_LANGUAGE_CODE === 'identify-language') {
+        tsParams.IdentifyLanguage = true;
+        if (TRANSCRIBE_LANGUAGE_OPTIONS) {
+            tsParams.LanguageOptions = TRANSCRIBE_LANGUAGE_OPTIONS.replace(/\s/g, '');
+            if (TRANSCRIBE_PREFERRED_LANGUAGE !== 'None') {
+                tsParams.PreferredLanguage = TRANSCRIBE_PREFERRED_LANGUAGE as LanguageCode;
+            }
+        }
+    } else if (TRANSCRIBE_LANGUAGE_CODE === 'identify-multiple-languages') {
+        tsParams.IdentifyMultipleLanguages = true;
+        if (TRANSCRIBE_LANGUAGE_OPTIONS) {
+            tsParams.LanguageOptions = TRANSCRIBE_LANGUAGE_OPTIONS.replace(/\s/g, '');
+            if (TRANSCRIBE_PREFERRED_LANGUAGE !== 'None') {
+                tsParams.PreferredLanguage = TRANSCRIBE_PREFERRED_LANGUAGE as LanguageCode;
+            }
+        }
+    } else {
+        tsParams.LanguageCode = TRANSCRIBE_LANGUAGE_CODE as LanguageCode;
+    }
+
+    if (IS_CONTENT_REDACTION_ENABLED && TRANSCRIBE_LANGUAGE_CODE === 'en-US') {
         tsParams.ContentRedactionType = CONTENT_REDACTION_TYPE as ContentRedactionType;
         if (TRANSCRIBE_PII_ENTITY_TYPES) {
             tsParams.PiiEntityTypes = TRANSCRIBE_PII_ENTITY_TYPES;
         }
     }
+
     if (CUSTOM_VOCABULARY_NAME) {
         tsParams.VocabularyName = CUSTOM_VOCABULARY_NAME;
     }
@@ -332,6 +340,9 @@ export const startTranscribe = async (callMetaData: CallMetaData, audioInputStre
     } else {
         (tsParams as StartStreamTranscriptionCommandInput).EnableChannelIdentification = true;
         (tsParams as StartStreamTranscriptionCommandInput).NumberOfChannels = 2;
+        if (showSpeakerLabel) {
+            tsParams.ShowSpeakerLabel = true;
+        }
         try {
             const response = await transcribeClient.send(
                 new StartStreamTranscriptionCommand(tsParams)
@@ -356,14 +367,20 @@ export const startTranscribe = async (callMetaData: CallMetaData, audioInputStre
         if (tsStream) {
             for await (const event of tsStream) {
                 if (event.TranscriptEvent) {
-                    const message: TranscriptEvent = event.TranscriptEvent;
-                    await writeTranscriptionSegment(message, callMetaData.callId, server);
+                    if (showSpeakerLabel) {
+                        const events = splitTranscriptEventBySpeaker(event.TranscriptEvent);
+                        for (const transcriptEvent of events) {
+                            await writeTranscriptionSegment(transcriptEvent, callMetaData, server);
+                        }
+                    } else {
+                        await writeTranscriptionSegment(event.TranscriptEvent, callMetaData, server);
+                    }
                 }
                 if (event.CategoryEvent && event.CategoryEvent.MatchedCategories) {
-                    await writeAddCallCategoryEvent(event.CategoryEvent, callMetaData.callId, server);
+                    await writeAddCallCategoryEvent(event.CategoryEvent, callMetaData, server);
                 }
                 if (event.UtteranceEvent && event.UtteranceEvent.UtteranceId) {
-                    await writeAddTranscriptSegmentEvent(event.UtteranceEvent, undefined, callMetaData.callId, server);
+                    await writeUtteranceEvent(event.UtteranceEvent, callMetaData, server);
                 }
             }
 
@@ -378,3 +395,69 @@ export const startTranscribe = async (callMetaData: CallMetaData, audioInputStre
     }
 };
 
+export const concatItemsIntoTranscript = (items: Item[]) => {
+    let text = '';
+    items.forEach(item => {
+        if (item.Type === 'punctuation') {
+            text = text.trim();
+        }
+        text += item.Content + ' ';
+    });
+
+    // Trim last space
+    text = text.trim();
+    return text;
+};
+
+export const splitTranscriptEventBySpeaker = (transcript:TranscriptEvent):TranscriptEvent[] => {
+    const itemsBySpeaker:{[key: string]: Item[]} = {};
+
+    let initialSpeaker:string;
+    let lastSpeaker:string;
+    let firstResult:Result;
+    if(transcript.Transcript && 
+        transcript.Transcript.Results &&
+        transcript.Transcript.Results[0] &&
+        transcript.Transcript.Results[0].Alternatives && 
+        transcript.Transcript.Results[0].Alternatives[0] &&
+        transcript.Transcript.Results[0].Alternatives[0].Items) {
+        
+        firstResult = transcript.Transcript.Results[0];
+        if (firstResult.IsPartial) {
+            return [transcript]; // we don't split here because partials dont contain speaker information
+        }
+        
+        transcript.Transcript.Results[0].Alternatives[0].Items.forEach(item => {
+            if (item.Speaker) { // this is because punctuation does not have a speaker label.
+                lastSpeaker = item.Speaker; 
+                if (initialSpeaker === undefined) {
+                    initialSpeaker = item.Speaker;
+                }
+            }
+            if (lastSpeaker) {
+                if(!itemsBySpeaker[lastSpeaker]) {
+                    itemsBySpeaker[lastSpeaker] = [];  
+                }
+                itemsBySpeaker[lastSpeaker].push(item);
+            }
+        });
+    }
+
+    return Object.keys(itemsBySpeaker).map(speaker => {
+        return {
+            Transcript: {
+                Results: [{
+                    Alternatives: [{
+                        Items: itemsBySpeaker[speaker],
+                        Transcript: concatItemsIntoTranscript(itemsBySpeaker[speaker])
+                    }],
+                    ChannelId: firstResult?.ChannelId,
+                    EndTime: itemsBySpeaker[speaker][itemsBySpeaker[speaker].length -1].EndTime,
+                    IsPartial: firstResult?.IsPartial,
+                    ResultId: firstResult?.ResultId + (speaker === initialSpeaker ? '' : '-' + speaker),
+                    StartTime: itemsBySpeaker[speaker][0].StartTime  
+                }]
+            }
+        };
+    });
+};

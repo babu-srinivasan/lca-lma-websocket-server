@@ -4,7 +4,6 @@
 import stream from 'stream';
 import { WriteStream } from 'fs';
 
-import { CallMetaData } from './lca';
 import { 
     TranscriptEvent,
     UtteranceEvent,
@@ -53,10 +52,22 @@ export type AddTranscriptSegmentEvent = CallEventBase<'ADD_TRANSCRIPT_SEGMENT'> 
     Sentiment?: string,
     TranscriptEvent?: TranscriptEvent,
     UtteranceEvent?: UtteranceEvent,
+    Speaker: string,
 };
 
 export type AddCallCategoryEvent = CallEventBase<'ADD_CALL_CATEGORY'> & {
     CategoryEvent: CategoryEvent,
+};
+
+export type CallMetaData = {
+    callId: Uuid,
+    fromNumber?: string,
+    toNumber?: string,
+    shouldRecordCall?: boolean,
+    agentId?: string,
+    samplingRate: number,
+    callEvent: string,
+    activeSpeaker: string,
 };
 
 export type SocketCallData = {

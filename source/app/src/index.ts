@@ -6,36 +6,31 @@ import websocket from '@fastify/websocket';
 import WebSocket from 'ws'; // type structure for the websocket object used by fastify/websocket
 import os from 'os';
 import path from 'path';
+import fs from 'fs';
+import { randomUUID } from 'crypto';
+import BlockStream from 'block-stream2';
+
 import { 
     S3Client, 
     PutObjectCommand
 } from '@aws-sdk/client-s3';
 
-import fs from 'fs';
-import { randomUUID } from 'crypto';
-import BlockStream from 'block-stream2';
-
 import {  
     startTranscribe, 
-    CallMetaData, 
     writeCallStartEvent,
     writeCallEndEvent,
     writeCallRecordingEvent,
-} from './lca';
-
-import {
+    CallMetaData,
     SocketCallData,
-} from './entities-lca';
+} from './calleventdata';
 
 import {
     createWavHeader,
     posixifyFilename,
     normalizeErrorForLogging,
-} from './utils';
-
-import {
     jwtVerifier,
-} from './jwt-verifier';
+    getClientIP,
+} from './common';
 
 const AWS_REGION = process.env['AWS_REGION'] || 'us-east-1';
 const RECORDINGS_BUCKET_NAME = process.env['RECORDINGS_BUCKET_NAME'] || undefined;
@@ -69,7 +64,8 @@ server.register(websocket);
 // Setup preHandler hook to authenticate 
 server.addHook('preHandler', async (request, reply) => {
     if (!request.url.includes('health')) { 
-        server.log.debug(`[AUTH]: [${request.socket.remoteAddress}] - Received preHandler hook for authentication. Calling jwtVerifier to authenticate. URI: <${request.url}>, Headers: ${JSON.stringify(request.headers)}`);
+        const clientIP = getClientIP(request.headers);
+        server.log.debug(`[AUTH]: [${clientIP}] - Received preHandler hook for authentication. URI: <${request.url}>, Headers: ${JSON.stringify(request.headers)}`);
     
         await jwtVerifier(request, reply);
     }
@@ -77,9 +73,10 @@ server.addHook('preHandler', async (request, reply) => {
 
 // Setup Route for websocket connection
 server.get('/api/v1/ws', { websocket: true, logLevel: 'debug' }, (connection, request) => {
-    server.log.debug(`[NEW CONNECTION]: [${request.socket.remoteAddress}] - Received new connection request @ /api/v1/ws. URI: <${request.url}>, Headers: ${JSON.stringify(request.headers)}`);
+    const clientIP = getClientIP(request.headers);
+    server.log.debug(`[NEW CONNECTION]: [${clientIP}] - Received new connection request @ /api/v1/ws. URI: <${request.url}>, Headers: ${JSON.stringify(request.headers)}`);
 
-    registerHandlers(connection.socket); // setup the handler functions for websocket events
+    registerHandlers(clientIP, connection.socket); // setup the handler functions for websocket events
 });
 
 type HealthCheckRemoteInfo = {
@@ -101,14 +98,14 @@ server.get('/health/check', { logLevel: 'warn' }, (request, response) => {
     const remoteIp = request.socket.remoteAddress || 'unknown';
     const item = healthCheckStats.get(remoteIp);
     if (!item) {
-        server.log.debug(`[HEALTH CHECK]: [${request.socket.remoteAddress}] - Received First health check from new source. URI: <${request.url}>, Headers: ${JSON.stringify(request.headers)} ==> Health Check status - CPU Usage%: ${cpuUsage}, IsHealthy: ${isHealthy}, Status: ${status}`);
+        server.log.debug(`[HEALTH CHECK]: [${remoteIp}] - Received First health check from new source. URI: <${request.url}>, Headers: ${JSON.stringify(request.headers)} ==> Health Check status - CPU Usage%: ${cpuUsage}, IsHealthy: ${isHealthy}, Status: ${status}`);
         healthCheckStats.set(remoteIp, { addr: remoteIp, tsFirst: now, tsLast: now, count: 1 });
     } else {
         item.tsLast = now;
         ++item.count;
-        const elapsed_seconds = (item.tsLast - item.tsFirst) / 1000;
+        const elapsed_seconds = Math.round((item.tsLast - item.tsFirst) / 1000);
         if ((elapsed_seconds % WS_LOG_INTERVAL) == 0) {
-            server.log.debug(`[HEALTH CHECK]: [${request.socket.remoteAddress}] - Received Health check # ${item.count} from source. URI: <${request.url}>, Headers: ${JSON.stringify(request.headers)} ==> Health Check status - CPU Usage%: ${cpuUsage}, IsHealthy: ${isHealthy}, Status: ${status}`);
+            server.log.debug(`[HEALTH CHECK]: [${remoteIp}] - Received Health check # ${item.count} from source. URI: <${request.url}>, Headers: ${JSON.stringify(request.headers)} ==> Health Check status - CPU Usage%: ${cpuUsage}, IsHealthy: ${isHealthy}, Status: ${status}`);
         }
     }
 
@@ -136,17 +133,17 @@ server.listen(
 );
 
 // Setup handlers for websocket events - 'message', 'close', 'error'
-const registerHandlers = (ws: WebSocket): void => {
+const registerHandlers = (clientIP: string, ws: WebSocket): void => {
     ws.on('message', async (data, isBinary): Promise<void> => {
         try {
             if (isBinary) {
                 const audioinput = Buffer.from(data as Uint8Array);
-                await onBinaryMessage(ws, audioinput);
+                await onBinaryMessage(clientIP, ws, audioinput);
             } else {
-                await onTextMessage(ws, Buffer.from(data as Uint8Array).toString('utf8'));
+                await onTextMessage(clientIP, ws, Buffer.from(data as Uint8Array).toString('utf8'));
             }
-        } catch (err) {
-            server.log.error(`[ON MESSAGE] - Error processing message: ${normalizeErrorForLogging(err)}`);
+        } catch (error) {
+            server.log.error(`[ON MESSAGE]: [${clientIP}] - Error processing message: ${normalizeErrorForLogging(error)}`);
             process.exit(1);
         }
     });
@@ -155,12 +152,12 @@ const registerHandlers = (ws: WebSocket): void => {
         try {
             onWsClose(ws, code);
         } catch (err) {
-            server.log.error(`[ON WSCLOSE]- Error in WS close handler: ${normalizeErrorForLogging(err)}`);
+            server.log.error(`[ON WSCLOSE]: [${clientIP}] - Error in WS close handler: ${normalizeErrorForLogging(err)}`);
         }
     });
 
     ws.on('error', (error: Error) => {
-        server.log.error(`[ON WSERROR]: onError - Websocket error, forcing close: ${normalizeErrorForLogging(error)}`);
+        server.log.error(`[ON WSERROR]: [${clientIP}] -  Websocket error, forcing close: ${normalizeErrorForLogging(error)}`);
         ws.close();
     });
 };
@@ -173,9 +170,14 @@ const getWavRecordingFileName = (callMetaData: CallMetaData): string => {
     return `${posixifyFilename(callMetaData.callId)}.wav`;
 };
 
-const onBinaryMessage = async (ws: WebSocket, data: Uint8Array): Promise<void> => {
+const onBinaryMessage = async (clientIP: string, ws: WebSocket, data: Uint8Array): Promise<void> => {
 
     const socketData = socketMap.get(ws);
+    let callid = 'unknown call ID';
+    if (socketData && socketData.callMetadata) {
+        callid = socketData.callMetadata.callId;
+    }
+    // server.log.info(`[ON BINARY MESSAGE]: [${clientIP}][${callid}] - Received audio data from client. ${JSON.stringify(socketData!.callMetadata)}`);
 
     if (socketData !== undefined && socketData.audioInputStream !== undefined &&
         socketData.writeRecordingStream !== undefined && socketData.recordingFileSize !== undefined) {
@@ -183,19 +185,19 @@ const onBinaryMessage = async (ws: WebSocket, data: Uint8Array): Promise<void> =
         socketData.writeRecordingStream.write(data);
         socketData.recordingFileSize += data.length;
     } else {
-        server.log.error('[ON BINARY MESSAGE] - Error: received audio data before metadata. Check logs for errors in START event.');
+        server.log.error(`[ON BINARY MESSAGE]: [${clientIP}][${callid}] - Error: received audio data before metadata. Check logs for errors in START event.`);
     }
 };
 
-const onTextMessage = async (ws: WebSocket, data: string): Promise<void> => {
+const onTextMessage = async (clientIP: string, ws: WebSocket, data: string): Promise<void> => {
     
     const callMetaData: CallMetaData = JSON.parse(data);
 
     try {
-        server.log.debug(`[ON TEXT MESSAGE]: [${callMetaData.callId}] - Call Metadata received from client: ${data}`);
+        server.log.debug(`[ON TEXT MESSAGE]: [${clientIP}][${callMetaData.callId}] - Call Metadata received from client: ${JSON.stringify(callMetaData)}`);
     } catch (error) {
-        server.log.error(`[ON TEXT MESSAGE]: [${callMetaData.callId}] - Error parsing call metadata: ${data} ${normalizeErrorForLogging(error)}`);
         callMetaData.callId = randomUUID();
+        server.log.error(`[ON TEXT MESSAGE]: [${clientIP}][${callMetaData.callId}] - Error parsing call metadata: ${data} ${normalizeErrorForLogging(error)}`);
     }
     
     if (callMetaData.callEvent === 'START') {        
@@ -226,10 +228,10 @@ const onTextMessage = async (ws: WebSocket, data: string): Promise<void> => {
     } else if (callMetaData.callEvent === 'END') {
         const socketData = socketMap.get(ws);
         if (!socketData || !(socketData.callMetadata)) {
-            server.log.error(`[${callMetaData.callEvent}]: [${callMetaData.callId}] - Received END without starting a call:  ${JSON.stringify(callMetaData)}`);
+            server.log.error(`[${callMetaData.callEvent}]: [${clientIP}][${callMetaData.callId}] - Received END without starting a call:  ${JSON.stringify(callMetaData)}`);
             return;
         }
-        server.log.debug(`[${callMetaData.callEvent}]: [${callMetaData.callId}] - Received call end event from client, writing it to KDS:  ${JSON.stringify(callMetaData)}`);
+        server.log.debug(`[${callMetaData.callEvent}]: [${clientIP}][${callMetaData.callId}] - Received call end event from client, writing it to KDS:  ${JSON.stringify(callMetaData)}`);
         await endCall(ws, callMetaData, socketData);
     }
 };
@@ -249,17 +251,19 @@ const endCall = async (ws: WebSocket, callMetaData: CallMetaData|undefined, sock
         callMetaData = socketData.callMetadata;
     }
 
-    if (socketData !== undefined && socketData.ended === false) {
+    if (socketData && !socketData.ended && callMetaData) {
         socketData.ended = true;
 
         await writeCallEndEvent(callMetaData, server);
         if (socketData.writeRecordingStream && socketData.recordingFileSize) {
             socketData.writeRecordingStream.end();
+
             const header = createWavHeader(callMetaData.samplingRate, socketData.recordingFileSize);
             const tempRecordingFilename = getTempRecordingFileName(callMetaData);
             const wavRecordingFilename = getWavRecordingFileName(callMetaData);
             const readStream = fs.createReadStream(path.join(LOCAL_TEMP_DIR, tempRecordingFilename));
             const writeStream = fs.createWriteStream(path.join(LOCAL_TEMP_DIR, wavRecordingFilename));
+
             writeStream.write(header);
             for await (const chunk of readStream) {
                 writeStream.write(chunk);
@@ -273,8 +277,10 @@ const endCall = async (ws: WebSocket, callMetaData: CallMetaData|undefined, sock
     
             const url = new URL(RECORDING_FILE_PREFIX + wavRecordingFilename, `https://${RECORDINGS_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com`);
             const recordingUrl = url.href;
-            
-            await writeCallRecordingEvent(callMetaData, recordingUrl, server);
+
+            if (callMetaData.shouldRecordCall) {
+                await writeCallRecordingEvent(callMetaData, recordingUrl, server);
+            }
         }
         if (socketData.audioInputStream) {
             server.log.debug(`[${callMetaData.callEvent}]: [${callMetaData.callId}] - Closing audio input stream:  ${JSON.stringify(callMetaData)}`);
@@ -286,7 +292,7 @@ const endCall = async (ws: WebSocket, callMetaData: CallMetaData|undefined, sock
             socketMap.delete(ws);
         }
     } else {
-        server.log.error(`[${callMetaData.callEvent}]: [${callMetaData.callId}] - Duplicate End call event. Already received the end call event: ${JSON.stringify(callMetaData)}`);
+        server.log.error(`[END]: [${callMetaData.callId}] - Duplicate End call event. Already received the end call event: ${JSON.stringify(callMetaData)}`);
 
     }
 };
