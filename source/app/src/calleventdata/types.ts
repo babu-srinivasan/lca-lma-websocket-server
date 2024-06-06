@@ -52,7 +52,7 @@ export type AddTranscriptSegmentEvent = CallEventBase<'ADD_TRANSCRIPT_SEGMENT'> 
     Sentiment?: string,
     TranscriptEvent?: TranscriptEvent,
     UtteranceEvent?: UtteranceEvent,
-    Speaker: string,
+    Speaker?: string,
 };
 
 export type AddCallCategoryEvent = CallEventBase<'ADD_CALL_CATEGORY'> & {
@@ -67,7 +67,7 @@ export type CallMetaData = {
     agentId?: string,
     samplingRate: number,
     callEvent: string,
-    activeSpeaker: string,
+    activeSpeaker?: string,
 };
 
 export type SocketCallData = {
